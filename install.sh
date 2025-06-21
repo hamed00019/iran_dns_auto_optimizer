@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Installer for DNS Optimizer - v4 (Hardened, Cross-Distro, Self-Managing)
+# Installer for DNS Optimizer - v4.1 (Hardened, Cross-Distro, Self-Managing)
 # This script can install, update, and uninstall the DNS Optimizer tool.
 #
 
@@ -76,7 +76,7 @@ check_and_install_deps() {
     elif command -v pacman &> /dev/null; then
         pm="pacman"
         pkgs="dnsutils coreutils curl gawk parallel"
-    elif command -v apk &> /dev/null;
+    elif command -v apk &> /dev/null; then
         pm="apk"
         pkgs="bind-tools coreutils curl gawk parallel"
     else
@@ -164,7 +164,7 @@ install() {
     notifempty
     compress
     delaycompress
-    su root adm
+    su root root # <-- IMPROVEMENT: Changed from 'adm' to 'root' for better compatibility
 }"
     echo "$logrotate_content" > "${LOGROTATE_DIR}/${LOGROTATE_NAME}"
     chmod 644 "${LOGROTATE_DIR}/${LOGROTATE_NAME}"
