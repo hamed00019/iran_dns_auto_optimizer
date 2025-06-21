@@ -1,0 +1,405 @@
+#!/bin/bash
+#
+# DNS Optimizer - High Performance & Secure DNS Management Script
+# Version: 6.0 (Hardened & Refactored)
+# Description: This script finds the fastest DNS servers and configures them automatically.
+#
+
+# --- Strict Mode & Security ---
+# Exit immediately if a command exits with a non-zero status.
+set -o errexit
+# Treat unset variables as an error when substituting.
+set -o nounset
+# Pipelines return the exit status of the last command to exit with a non-zero status.
+set -o pipefail
+# Set a secure default umask for file creation.
+umask 077 # Owner: rwx, Group: ---, Other: ---
+
+# --- Global Constants ---
+readonly SCRIPT_NAME="dns-optimizer"
+readonly CONFIG_FILE="/etc/dns-optimizer.conf"
+readonly LOCK_FILE="/var/run/dns-optimizer.lock"
+readonly COLOR_RED='\033[0;31m'
+readonly COLOR_GREEN='\033[0;32m'
+readonly COLOR_YELLOW='\033[1;33m'
+readonly COLOR_BLUE='\033[0;34m'
+readonly COLOR_NC='\033[0m'
+
+# This variable will hold the path to the temporary directory.
+TEMP_DIR=""
+
+# --- Utility Functions ---
+
+# Prints a formatted message to stderr.
+# Usage: log "INFO" "This is an info message."
+log() {
+    local level="$1"
+    local message="$2"
+    local color="$COLOR_NC"
+
+    case "$level" in
+        "ERROR") color="$COLOR_RED" ;;
+        "WARN") color="$COLOR_YELLOW" ;;
+        "SUCCESS") color="$COLOR_GREEN" ;;
+        "INFO") color="$COLOR_BLUE" ;;
+    esac
+
+    # Also log to file if LOG_FILE is set and writable
+    if [[ -n "${LOG_FILE:-}" ]] && [[ -w "$(dirname "$LOG_FILE")" ]]; then
+        echo -e "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> "$LOG_FILE"
+    fi
+    
+    # Always print errors and success messages to stderr
+    if [[ "$level" == "ERROR" || "$level" == "SUCCESS" ]]; then
+        echo -e "${color}[$level]${COLOR_NC} $message" >&2
+    fi
+}
+
+# Ensures the script is run with root privileges.
+assert_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        log "ERROR" "This operation requires root privileges. Please use sudo."
+        exit 1
+    fi
+}
+
+# Cleanup function to be called on script exit to remove temporary files.
+cleanup() {
+    if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
+
+# --- Core Logic ---
+
+# Loads and validates the configuration file.
+load_and_validate_config() {
+    if [[ ! -r "$CONFIG_FILE" ]]; then
+        log "ERROR" "Configuration file not found or not readable at '$CONFIG_FILE'."
+        exit 1
+    fi
+
+    # Source the config file to get the variables
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+
+    # Validate essential variables
+    if [[ ${#DNS_SERVERS[@]} -eq 0 ]]; then
+        log "ERROR" "Config error: 'DNS_SERVERS' array is empty."
+        exit 1
+    fi
+    if ! [[ "${TOP_DNS_COUNT:-0}" =~ ^[1-9][0-9]*$ ]]; then
+        log "ERROR" "Config error: 'TOP_DNS_COUNT' must be a positive integer."
+        exit 1
+    fi
+    if ! [[ "${MIN_SUCCESS_RATE:-101}" -ge 0 && "${MIN_SUCCESS_RATE:-101}" -le 100 ]]; then
+        log "ERROR" "Config error: 'MIN_SUCCESS_RATE' must be between 0 and 100."
+        exit 1
+    fi
+    log "INFO" "Configuration loaded and validated."
+}
+
+# The core function that tests a single DNS server.
+# This function is designed to be run in a subshell for parallel execution.
+# Arguments: $1:dns_ip, $2:dns_name, $3:result_file_path, $@:domains_to_test
+test_dns_server() {
+    local dns_ip="$1"
+    local dns_name="$2"
+    local result_file="$3"
+    shift 3
+    local domains_to_test=("$@")
+
+    local total_time=0
+    local success_count=0
+    local total_probes=0
+
+    for domain in "${domains_to_test[@]}"; do
+        for ((i=0; i<PROBE_COUNT; i++)); do
+            total_probes=$((total_probes + 1))
+            # Execute dig and capture timing info. The `+stats` gives reliable timing.
+            local response
+            response=$(dig @"$dns_ip" "$domain" +time="$TIMEOUT_SECONDS" +tries=1 +stats +noall +answer 2>&1)
+
+            if [[ $? -eq 0 ]] && [[ "$response" =~ "Query time:" ]]; then
+                # Extract query time reliably
+                local qtime
+                qtime=$(echo "$response" | awk -F'Query time: ' '{print $2}' | awk '{print $1}')
+                if [[ -n "$qtime" ]] && [[ "$qtime" -lt "$MAX_RESPONSE_TIME" ]]; then
+                    total_time=$((total_time + qtime))
+                    success_count=$((success_count + 1))
+                fi
+            fi
+        done
+    done
+
+    local avg_time=99999
+    local success_rate=0
+    if [[ "$success_count" -gt 0 ]]; then
+        avg_time=$((total_time / success_count))
+        success_rate=$((success_count * 100 / total_probes))
+    fi
+
+    # Atomically write the result to its own file to prevent race conditions.
+    echo "${avg_time}|${success_rate}|${dns_ip}|${dns_name}" > "$result_file"
+}
+export -f test_dns_server # Export function for parallel execution
+
+# Main optimization process
+run_optimization() {
+    local mode="$1" # "quick", "standard", or "full"
+    
+    # Determine which servers and domains to test based on the mode
+    local priority_level=1
+    local domains_to_test=("${TEST_DOMAINS[@]}")
+    case "$mode" in
+        "quick")
+            priority_level=1
+            domains_to_test=("${TEST_DOMAINS[@]:0:$QUICK_TEST_DOMAIN_COUNT}")
+            ;;
+        "standard")
+            priority_level=2
+            ;;
+        "full")
+            priority_level=3
+            ;;
+    esac
+
+    log "INFO" "Starting DNS optimization (mode: $mode)."
+
+    local filtered_servers=()
+    for dns_entry in "${DNS_SERVERS[@]}"; do
+        # Validate format IP:Name:Priority
+        if ! [[ "$dns_entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:.+:[1-3]$ ]]; then
+            log "WARN" "Skipping invalid DNS entry in config: '$dns_entry'"
+            continue
+        fi
+        local priority="${dns_entry##*:}"
+        if [[ "$priority" -le "$priority_level" ]]; then
+            filtered_servers+=("$dns_entry")
+        fi
+    done
+
+    if [[ ${#filtered_servers[@]} -eq 0 ]]; then
+        log "ERROR" "No DNS servers match the criteria for mode '$mode'. Aborting."
+        exit 1
+    fi
+    
+    echo -e "${COLOR_BLUE}🧪 Testing ${#filtered_servers[@]} servers against ${#domains_to_test[@]} domains...${COLOR_NC}"
+
+    # Use GNU Parallel for controlled concurrency if available, otherwise fallback to xargs.
+    if command -v parallel &> /dev/null; then
+        local parallel_jobs="$PARALLEL_JOBS"
+        if [[ "$parallel_jobs" -eq 0 ]]; then
+            parallel_jobs=$(nproc)
+        fi
+
+        printf "%s\n" "${filtered_servers[@]}" | parallel -j "$parallel_jobs" --colsep ':' \
+            test_dns_server "{1}" "{2}" "${TEMP_DIR}/{1}.result" "${domains_to_test[@]}"
+    else
+        log "WARN" "GNU Parallel not found. Falling back to xargs (might be slower)."
+        # Fallback using xargs (less control over job slots)
+        for dns_entry in "${filtered_servers[@]}"; do
+            IFS=':' read -r dns_ip dns_name _ <<< "$dns_entry"
+            test_dns_server "$dns_ip" "$dns_name" "${TEMP_DIR}/${dns_ip}.result" "${domains_to_test[@]}" &
+        done
+        wait
+    fi
+
+    echo -e "${COLOR_BLUE}📊 Analyzing results...${COLOR_NC}"
+
+    local all_results=""
+    for result_file in "${TEMP_DIR}"/*.result; do
+        [[ -f "$result_file" ]] && all_results+=$(cat "$result_file")$'\n'
+    done
+    
+    # Filter, sort, and select the best DNS servers
+    local valid_servers
+    valid_servers=$(echo -e "$all_results" | awk -F'|' -v min_rate="$MIN_SUCCESS_RATE" '$2 >= min_rate')
+
+    if [[ -z "$valid_servers" ]]; then
+        log "ERROR" "No suitable DNS servers found. System DNS settings will not be changed."
+        return 1
+    fi
+
+    local sorted_servers
+    sorted_servers=$(echo -e "$valid_servers" | sort -t'|' -k1,1n -k2,2nr | head -n "$TOP_DNS_COUNT")
+
+    local best_dns_ips=()
+    echo -e "\n${COLOR_GREEN}🏆 Top DNS Servers:${COLOR_NC}"
+    while IFS= read -r line; do
+        IFS='|' read -r avg_time success_rate dns_ip dns_name <<< "$line"
+        printf "  %-25s (%s) - ${COLOR_YELLOW}%dms${COLOR_NC} avg, ${COLOR_GREEN}%d%%${COLOR_NC} success\n" \
+               "$dns_name" "$dns_ip" "$avg_time" "$success_rate"
+        best_dns_ips+=("$dns_ip")
+    done <<< "$sorted_servers"
+
+    update_system_dns "${best_dns_ips[@]}"
+}
+
+# Updates the system's DNS settings safely.
+# Supports both systemd-resolved and direct /etc/resolv.conf modification.
+update_system_dns() {
+    local -a dns_list=("$@")
+    assert_root
+    log "INFO" "Updating system DNS with: ${dns_list[*]}"
+
+    # Backup current /etc/resolv.conf
+    if ! cp -aL /etc/resolv.conf "$RESOLV_BACKUP_PATH"; then
+        log "ERROR" "Failed to create backup of /etc/resolv.conf. Aborting update."
+        return 1
+    fi
+    log "INFO" "Backup of current DNS settings created at '$RESOLV_BACKUP_PATH'"
+
+    # Check if systemd-resolved is active
+    if systemctl is-active --quiet systemd-resolved; then
+        log "INFO" "systemd-resolved is active. Using 'resolvectl' to set DNS."
+        local interface
+        # Find the default network interface
+        interface=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+        if [[ -z "$interface" ]]; then
+            log "ERROR" "Could not detect default network interface. Cannot configure systemd-resolved."
+            return 1
+        fi
+        if ! resolvectl dns "$interface" "${dns_list[@]}"; then
+            log "ERROR" "Failed to set DNS via resolvectl."
+            return 1
+        fi
+    else
+        log "INFO" "systemd-resolved is not active. Modifying /etc/resolv.conf directly."
+        local temp_resolv
+        temp_resolv=$(mktemp)
+        {
+            echo "# Generated by DNS Optimizer on $(date)"
+            echo "# Website: https://github.com/hamed00019/iran_dns_auto_optimizer"
+            for dns in "${dns_list[@]}"; do
+                echo "nameserver $dns"
+            done
+            echo ""
+            echo "options edns0 timeout:2 attempts:2"
+        } > "$temp_resolv"
+        
+        # Make /etc/resolv.conf writable (some systems make it immutable)
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        if ! mv "$temp_resolv" /etc/resolv.conf; then
+            log "ERROR" "Failed to write to /etc/resolv.conf. Check permissions."
+            rm -f "$temp_resolv"
+            return 1
+        fi
+    fi
+    
+    log "SUCCESS" "System DNS configuration updated successfully."
+    echo -e "${COLOR_GREEN}✅ DNS settings have been updated.${COLOR_NC}"
+}
+
+# --- User Commands ---
+
+cmd_status() {
+    echo -e "${COLOR_BLUE}--- DNS Optimizer Status ---${COLOR_NC}"
+    echo -e "\n${COLOR_YELLOW}Current DNS Servers (/etc/resolv.conf):${COLOR_NC}"
+    grep -E "^nameserver" /etc/resolv.conf | sed 's/^/  /' || echo "  No nameservers configured."
+    
+    echo -e "\n${COLOR_YELLOW}Timer Status:${COLOR_NC}"
+    if command -v systemctl &> /dev/null; then
+        systemctl list-timers | grep 'dns-optimizer' || echo "  DNS Optimizer timer not found or not active."
+    else
+        echo "  systemctl not found. Cannot check timer status."
+    fi
+}
+
+cmd_restore() {
+    assert_root
+    if [[ ! -f "$RESOLV_BACKUP_PATH" ]]; then
+        log "ERROR" "No backup file found at '$RESOLV_BACKUP_PATH'."
+        return 1
+    fi
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    if cp -aL "$RESOLV_BACKUP_PATH" /etc/resolv.conf; then
+        log "SUCCESS" "DNS configuration restored from backup."
+    else
+        log "ERROR" "Failed to restore DNS configuration from backup."
+        return 1
+    fi
+}
+
+cmd_show_logs() {
+    local lines="${1:-20}"
+    echo -e "${COLOR_BLUE}--- Last ${lines} Log Entries ---${COLOR_NC}"
+    if [[ -r "$LOG_FILE" ]]; then
+        tail -n "$lines" "$LOG_FILE"
+    else
+        log "WARN" "Log file not found or is not readable at '${LOG_FILE}'"
+    fi
+}
+
+show_help() {
+    echo -e "${COLOR_BLUE}DNS Optimizer v6.0 (Hardened)${COLOR_NC}"
+    echo "A script to find and set the best DNS servers for your system."
+    echo
+    echo -e "${COLOR_YELLOW}Usage:${COLOR_NC} sudo $SCRIPT_NAME [command]"
+    echo
+    echo -e "${COLOR_YELLOW}Commands:${COLOR_NC}"
+    echo -e "  ${COLOR_GREEN}run${COLOR_NC}         Run standard optimization (default)."
+    echo -e "  ${COLOR_GREEN}quick${COLOR_NC}      Run a faster optimization on high-priority servers."
+    echo -e "  ${COLOR_GREEN}full${COLOR_NC}       Run a comprehensive optimization on all servers."
+    echo -e "  ${COLOR_GREEN}status${COLOR_NC}     Show current system DNS settings and timer status."
+    echo -e "  ${COLOR_GREEN}restore${COLOR_NC}    Restore the last DNS configuration from backup."
+    echo -e "  ${COLOR_GREEN}log [N]${COLOR_NC}    Show the last N log entries (default: 20)."
+    echo -e "  ${COLOR_GREEN}config${COLOR_NC}     Edit the configuration file."
+    echo -e "  ${COLOR_GREEN}help${COLOR_NC}       Display this help message."
+}
+
+# --- Main Function ---
+main() {
+    # Ensure external commands are available
+    for cmd in dig awk sort head nproc ip; do
+        if ! command -v "$cmd" &> /dev/null; then
+            log "ERROR" "Required command '$cmd' is not installed. Please install it."
+            exit 1
+        fi
+    done
+
+    # Parse command
+    local command="${1:-run}"
+
+    # Certain commands do not require root
+    case "$command" in
+        "status"|"log"|"help")
+            ;; # No root needed
+        *)
+            assert_root
+            ;;
+    esac
+    
+    # Use flock for race condition prevention
+    # The script will wait for the lock to be released. Use -n for immediate exit.
+    (
+        flock 200
+        
+        # Create a secure temporary directory and set up cleanup
+        TEMP_DIR=$(mktemp -d "/tmp/${SCRIPT_NAME}.XXXXXX")
+        trap cleanup EXIT
+        
+        load_and_validate_config
+
+        case "$command" in
+            "run") run_optimization "standard" ;;
+            "quick") run_optimization "quick" ;;
+            "full") run_optimization "full" ;;
+            "status") cmd_status ;;
+            "restore") cmd_restore ;;
+            "log") cmd_show_logs "${2:-20}" ;;
+            "config") "${EDITOR:-nano}" "$CONFIG_FILE" ;;
+            "help"|"--help"|"-h") show_help ;;
+            *)
+                log "ERROR" "Unknown command: '$command'"
+                show_help
+                exit 1
+                ;;
+        esac
+    ) 200>"$LOCK_FILE"
+
+    exit 0
+}
+
+# Execute the main function with all script arguments
+main "$@"
