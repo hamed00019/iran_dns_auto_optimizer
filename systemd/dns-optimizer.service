@@ -1,0 +1,30 @@
+# File: systemd/dns-optimizer.service
+[Unit]
+Description=DNS Optimizer - Refresh DNS server list for optimal performance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+# Run the standard optimization. The script handles logging.
+ExecStart=/usr/local/bin/dns-optimizer run
+
+# Harden the service for better security
+# Prevents writing to /usr, /boot, and /etc
+ProtectSystem=full
+# Prevents writing to user home directories
+ProtectHome=true
+# Use a private /tmp directory
+PrivateTmp=true
+# Prevents processes from gaining new privileges
+NoNewPrivileges=true
+# Restrict access to devices
+PrivateDevices=true
+# Restrict network access to the necessary interfaces
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

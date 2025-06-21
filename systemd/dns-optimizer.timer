@@ -1,0 +1,18 @@
+# File: systemd/dns-optimizer.timer
+
+[Unit]
+Description=Run DNS Optimizer periodically to keep DNS fresh
+Requires=dns-optimizer.service
+
+[Timer]
+# Run 5 minutes after boot
+OnBootSec=5min
+# Run every 4 hours thereafter
+OnUnitActiveSec=4h
+# Add a random delay to avoid running at the exact same time on multiple machines
+RandomizedDelaySec=10min
+# If the system was powered off, run on the next boot if the time was missed
+Persistent=true
+
+[Install]
+WantedBy=timers.target
